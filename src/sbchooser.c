@@ -188,6 +188,7 @@ main(int argc, char *argv[])
 	}
 
 	clean_up_context(&ctx);
+	OPENSSL_cleanup();
 
 	return 0;
 }
