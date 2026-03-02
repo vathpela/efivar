@@ -120,6 +120,9 @@ add_one_cert(sig_data_t *sig, X509 *x509, cert_data_t **worst_cert)
 	cert_data_t **new_certs = NULL;
 	size_t n_certs = sig->n_certs;
 	int rc;
+	char buf0[1024];
+
+	memset(buf0, 0, sizeof(buf0));
 
 	new_certs = reallocarray(sig->certs, n_certs + 1, sizeof(cert_data_t));
 	if (!new_certs)
@@ -143,11 +146,15 @@ add_one_cert(sig_data_t *sig, X509 *x509, cert_data_t **worst_cert)
 
 	if (!sig->earliest_not_before ||
 	    time_cmp(cert->not_before, sig->earliest_not_before) < 0) {
+		fmt_time(cert->not_before, buf0);
+		debug("setting sig->earliest_not_before to %s", buf0);
 		sig->earliest_not_before = cert->not_before;
 	}
 
 	if (!sig->latest_not_after ||
 	    time_cmp(cert->not_after, sig->latest_not_after) > 0) {
+		fmt_time(cert->not_after, buf0);
+		debug("setting sig->latest_not_after to %s", buf0);
 		sig->latest_not_after = cert->not_after;
 	}
 
@@ -200,6 +207,9 @@ add_one_sig(pe_file_t *pe, uint8_t *data, size_t datasz)
 	size_t n_sigs = pe->n_sigs + 1;
 	int rc;
 	cert_data_t *worst_cert = NULL;
+	char buf0[1024];
+
+	memset(buf0, 0, sizeof(buf0));
 
 	sigs = reallocarray(pe->sigs, n_sigs, sizeof(*sigs));
 	if (!sigs)
@@ -229,6 +239,22 @@ add_one_sig(pe_file_t *pe, uint8_t *data, size_t datasz)
 		sig->lowest_md_secbits = worst_cert->md_secbits;
 		sig->lowest_pk_secbits = worst_cert->pk_secbits;
 	}
+
+	if (!pe->earliest_not_before) {
+		pe->earliest_not_before = sig->earliest_not_before;
+	} else if (time_cmp(pe->earliest_not_before, sig->earliest_not_before) > 0) {
+		pe->earliest_not_before = sig->earliest_not_before;
+	}
+	fmt_time(pe->earliest_not_before, buf0);
+	debug("set pe->earliest_not_before to %s", buf0);
+
+	if (!pe->latest_not_after) {
+		pe->latest_not_after = sig->latest_not_after;
+	} else if (time_cmp(pe->latest_not_after, sig->latest_not_after) < 0) {
+		pe->latest_not_after = sig->latest_not_after;
+	}
+	fmt_time(pe->latest_not_after, buf0);
+	debug("set pe->latest_not_after to %s", buf0);
 
 	sigs[pe->n_sigs] = sig;
 	pe->n_sigs = n_sigs;
@@ -766,8 +792,27 @@ get_highest_hash_secbits(pe_file_t *pe)
 	return 0;
 }
 
+static void __attribute__((__unused__))
+debug_print_trusted_cert(cert_data_t *anchor, cert_data_t *signer)
+{
+	if (efi_get_verbose() < DEBUG_LEVEL)
+		return;
+
+	char buf0[4096];
+	char buf1[4096];
+
+	X509_NAME_oneline(anchor->subject, buf0, 4096);
+
+	debug("anchor subject:\"%s\"", buf0);
+
+	X509_NAME_oneline(signer->issuer, buf0, 4096);
+	X509_NAME_oneline(signer->subject, buf1, 4096);
+
+	debug("signer issuer:\"%s\" subject:\"%s\"", buf0, buf1);
+}
+
 static bool
-is_signing_cert_revoked(sbchooser_context_t *ctx, cert_data_t *sigcert)
+get_revocation(sbchooser_context_t *ctx, cert_data_t *sigcert)
 {
 	debug("looking for certs in dbx");
 
@@ -775,11 +820,15 @@ is_signing_cert_revoked(sbchooser_context_t *ctx, cert_data_t *sigcert)
 		cert_data_t *dbxcert = ctx->dbx_certs[i];
 
 		if (is_same_cert(sigcert, dbxcert)) {
+			if (!sigcert->revoked_cert)
+				sigcert->revoked_cert = dbxcert;
 			debug("found");
 			return true;
 		}
 
 		if (is_issuing_cert(sigcert, dbxcert)) {
+			if (!sigcert->revoked_cert)
+				sigcert->revoked_cert = dbxcert;
 			debug("found");
 			return true;
 		}
@@ -794,6 +843,89 @@ is_signing_cert_revoked(sbchooser_context_t *ctx, cert_data_t *sigcert)
 	return false;
 }
 
+static bool
+get_authorization(sbchooser_context_t *ctx, cert_data_t *sigcert)
+{
+	debug("looking for certs in db");
+
+	for (size_t i = 0; i < ctx->n_db_certs; i++) {
+		cert_data_t *dbcert = ctx->db_certs[i];
+
+		if (is_same_cert(sigcert, dbcert)) {
+			if (!sigcert->trust_anchor_cert)
+				sigcert->trust_anchor_cert = dbcert;
+			debug("found");
+			return true;
+		}
+
+		if (is_issuing_cert(sigcert, dbcert)) {
+			if (!sigcert->trust_anchor_cert)
+				sigcert->trust_anchor_cert = dbcert;
+			debug("found");
+			return true;
+		}
+		/*
+		 * XXX PJFIX: right now we don't check cert authorizations
+		 * by TBS hash.  I think we could solve this with
+		 * X509_digest() and looking them up, but I don't have any
+		 * db examples handy.
+		 */
+	}
+	debug("none found");
+	return false;
+}
+
+
+static void
+score_cert(sbchooser_context_t *ctx, cert_data_t *cert)
+{
+	if (get_revocation(ctx, cert)) {
+		char revoker[4096];
+		char subject[4096];
+
+		memset(revoker, 0, sizeof(revoker));
+		memset(subject, 0, sizeof(subject));
+
+		X509_NAME_oneline(cert->revoked_cert->subject, revoker, 4095);
+		X509_NAME_oneline(cert->subject, subject, 4095);
+
+		debug("cert \"%s\" revoked by \"%s\"", subject, revoker);
+		cert->revoked = true;
+	}
+
+	if (get_authorization(ctx, cert)) {
+		char trust_anchor[4096];
+		char subject[4096];
+
+		memset(trust_anchor, 0, sizeof(trust_anchor));
+		memset(subject, 0, sizeof(subject));
+
+		X509_NAME_oneline(cert->trust_anchor_cert->subject,
+				  trust_anchor, 4095);
+		X509_NAME_oneline(cert->subject, subject, 4095);
+
+		debug("cert \"%s\" trusted by \"%s\"", subject, trust_anchor);
+		cert->trusted = true;
+	}
+}
+
+static void
+score_sig(sbchooser_context_t *ctx, sig_data_t *sig)
+{
+	for (size_t j = 0; j < sig->n_certs; j++) {
+		cert_data_t *sigcert = sig->certs[j];
+
+		score_cert(ctx, sigcert);
+		if (sigcert->trusted)
+			sig->trusted = true;
+
+		if (sigcert->revoked)
+			sig->revoked = true;
+	}
+	if (sig->revoked)
+		sig->trusted = false;
+}
+
 void
 score_pe(sbchooser_context_t *ctx, pe_file_t *pe)
 {
@@ -802,19 +934,113 @@ score_pe(sbchooser_context_t *ctx, pe_file_t *pe)
 	check_dbx_hashes(ctx, pe);
 	check_db_hashes(ctx, pe);
 
+	uint32_t least_pk_secbits = 0xffffffffull;
+	uint32_t least_md_secbits = 0xffffffffull;
+
+	bool found_trusted_sig = false;
 	for (size_t i = 0; i < pe->n_sigs; i++) {
 		sig_data_t *sig = pe->sigs[i];
 
-		for (size_t j = 0; j < sig->n_certs; j++) {
-			cert_data_t *sigcert = sig->certs[j];
+		score_sig(ctx, sig);
+		if (sig->trusted) {
+			found_trusted_sig = true;
 
-			if (is_signing_cert_revoked(ctx, sigcert)) {
-				debug("PE \"%s\" signature %zu is revoked by cert", pe->filename, i);
-				sig->revoked = true;
-				break;
+			if (!pe->earliest_not_before ||
+			    time_cmp(sig->earliest_not_before, pe->earliest_not_before) < 0) {
+				pe->earliest_not_before = sig->earliest_not_before;
+			}
+
+			if (!pe->latest_not_after ||
+			    time_cmp(sig->latest_not_after, pe->latest_not_after) > 0) {
+				pe->latest_not_after = sig->latest_not_after;
+			}
+
+			if (sig->lowest_md_secbits < least_md_secbits) {
+				least_md_secbits = sig->lowest_md_secbits;
+			}
+			if (sig->lowest_pk_secbits < least_pk_secbits) {
+				least_pk_secbits = sig->lowest_pk_secbits;
 			}
 		}
 	}
+	if (!found_trusted_sig) {
+		pe->secbits = 0;
+		return;
+	}
+	if (least_md_secbits == 0xffffffffull) {
+		least_md_secbits = 0;
+	}
+	if (least_pk_secbits == 0xffffffffull) {
+		least_pk_secbits = 0;
+	}
+	pe->secbits = least_md_secbits < least_pk_secbits ? least_md_secbits : least_pk_secbits;
+}
+
+static int
+compare_validities(pe_file_t *pe0, pe_file_t *pe1)
+{
+	int rc = 0;
+	char buf0[1024];
+	char buf1[1024];
+	char default_pref[] = "no preference";
+	char *pref;
+
+	/*
+	 * Dunno when this can happen, but always prefer the one that's
+	 * signed if we get this far...
+	 */
+	if (pe0->latest_not_after && !pe1->latest_not_after)
+		return -1;
+	if (!pe0->latest_not_after && pe1->latest_not_after)
+		return 1;
+
+	/*
+	 * prefer the one that has certs expiring the latest
+	 */
+	fmt_time(pe0->latest_not_after, buf0);
+	fmt_time(pe1->latest_not_after, buf1);
+	rc = time_cmp(pe0->latest_not_after, pe1->latest_not_after);
+	if (rc < 0)
+		pref = buf1;
+	else if (rc > 0)
+		pref = buf0;
+	else
+		pref = default_pref;
+
+	debug("finding latest of \"%s\" and \"%s\": %s", buf0, buf1, pref);
+	if (rc < 0)
+		return 1;
+	if (rc > 0)
+		return -1;
+
+	/*
+	 * Dunno when this can happen, but always prefer the one that's
+	 * signed if we get this far...
+	 */
+	if (pe0->earliest_not_before && !pe1->earliest_not_before)
+		return -1;
+	if (!pe0->earliest_not_before && pe1->earliest_not_before)
+		return 1;
+
+	/*
+	 * prefer the one that has certs starting the earliest
+	 */
+	fmt_time(pe0->earliest_not_before, buf0);
+	fmt_time(pe1->earliest_not_before, buf1);
+	rc = time_cmp(pe1->earliest_not_before, pe0->earliest_not_before);
+	if (rc < 0)
+		pref = buf1;
+	else if (rc > 0)
+		pref = buf0;
+	else
+		pref = default_pref;
+
+	debug("finding earliest of \"%s\" and \"%s\": %s", buf0, buf1, pref);
+	if (rc < 0)
+		return 1;
+	if (rc > 0)
+		return -1;
+	return 0;
 }
 
 int
@@ -822,6 +1048,7 @@ pe_cmp(const void *p0, const void *p1)
 {
 	pe_file_t *pe0 = *(pe_file_t **)p0;
 	pe_file_t *pe1 = *(pe_file_t **)p1;
+	int score;
 
 	bool pe0_revoked = is_revoked_by_hash(pe0, NULL);
 	bool pe1_revoked = is_revoked_by_hash(pe1, NULL);
@@ -840,7 +1067,27 @@ pe_cmp(const void *p0, const void *p1)
 	uint32_t pe0_hash_secbits = get_highest_hash_secbits(pe0);
 	uint32_t pe1_hash_secbits = get_highest_hash_secbits(pe1);
 
-	return pe1_hash_secbits - pe0_hash_secbits;
+	score = pe1_hash_secbits - pe0_hash_secbits;
+	if (score != 0)
+		return score;
+
+	score = pe1->secbits - pe0->secbits;
+	debug("\"%s\" (secbits %"PRIu32") vs \"%s\" (secbits %"PRIu32"): %d",
+	      pe0->filename, pe0->secbits, pe1->filename, pe1->secbits, score);
+	if (score != 0)
+		return score;
+
+	debug("security strength is equal; comparing validities");
+	score = compare_validities(pe0, pe1);
+	if (score < 0) {
+		debug("prefer \"%s\"", pe1->filename);
+	} else if (score > 0) {
+		debug("prefer \"%s\"", pe0->filename);
+	} else {
+		debug("no preference");
+		return strcmp(pe0->filename, pe1->filename);
+	}
+	return score;
 }
 
 // vim:fenc=utf-8:tw=75:noet

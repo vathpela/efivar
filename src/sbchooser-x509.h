@@ -36,6 +36,9 @@ struct cert_data {
 	bool trusted;
 	cert_data_t *trust_anchor_cert; // cert it's trusted by (self or
 					// issuer)
+
+	bool revoked;
+	cert_data_t *revoked_cert;	// the cert that's actually in dbx
 };
 
 void free_cert(cert_data_t *cert);
