@@ -891,6 +891,12 @@ score_cert(sbchooser_context_t *ctx, cert_data_t *cert)
 		X509_NAME_oneline(cert->revoked_cert->subject, revoker, 4095);
 		X509_NAME_oneline(cert->subject, subject, 4095);
 
+		if (cert->rationale) {
+			free(cert->rationale);
+			cert->rationale = NULL;
+		}
+		asprintf(&cert->rationale, "cert \"%s\" is revoked by \"%s\"",
+			 subject, revoker);
 		debug("cert \"%s\" revoked by \"%s\"", subject, revoker);
 		cert->revoked = true;
 	}
@@ -906,6 +912,10 @@ score_cert(sbchooser_context_t *ctx, cert_data_t *cert)
 				  trust_anchor, 4095);
 		X509_NAME_oneline(cert->subject, subject, 4095);
 
+		if (!cert->rationale) {
+			asprintf(&cert->rationale, "cert \"%s\" is trusted by \"%s\"",
+				 subject, trust_anchor);
+		}
 		debug("cert \"%s\" trusted by \"%s\"", subject, trust_anchor);
 		cert->trusted = true;
 	}
@@ -918,11 +928,17 @@ score_sig(sbchooser_context_t *ctx, sig_data_t *sig)
 		cert_data_t *sigcert = sig->certs[j];
 
 		score_cert(ctx, sigcert);
-		if (sigcert->trusted)
+		if (sigcert->trusted) {
+			if (!sig->revoked) {
+				sig->rationale = sigcert->rationale;
+			}
 			sig->trusted = true;
+		}
 
-		if (sigcert->revoked)
+		if (sigcert->revoked) {
+			sig->rationale = sigcert->rationale;
 			sig->revoked = true;
+		}
 	}
 	if (sig->revoked)
 		sig->trusted = false;
@@ -945,6 +961,9 @@ score_pe(sbchooser_context_t *ctx, pe_file_t *pe)
 
 		score_sig(ctx, sig);
 
+		if (sig->revoked && !pe->rationale)
+			pe->rationale = sig->rationale;
+
 		if (sig->trusted) {
 			found_trusted_sig = true;
 
@@ -964,6 +983,7 @@ score_pe(sbchooser_context_t *ctx, pe_file_t *pe)
 			if (sig->lowest_pk_secbits < least_pk_secbits) {
 				least_pk_secbits = sig->lowest_pk_secbits;
 			}
+			pe->rationale = sig->rationale;
 		}
 
 		if (pe->first_sig_only)
